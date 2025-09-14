@@ -142,7 +142,7 @@ def main():
             else: weak_count += 1
 
     # Telegram message
-    lines = ["=== SHORT SIGNALS ==="]
+    lines = ["=== SHORT SIGNALS ===20/50 EMA"]
     lines.extend(signals if signals else ["No valid short signals this run."])
     lines.append("\n=== MISSING COINS ===")
     lines.extend(missing if missing else ["None"])
