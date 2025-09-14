@@ -9,15 +9,34 @@ jobs:
   run-script:
     runs-on: ubuntu-latest
     steps:
+      # 1️⃣ Checkout repo
       - name: Checkout repo
         uses: actions/checkout@v4
 
+      # 2️⃣ Clean up old logs
+      - name: Cleanup old logs
+        run: |
+          echo "Deleting old log files..."
+          rm -rf logs/*.txt || echo "No old logs found"
+        # Make sure your script writes to logs/ folder
+
+      # 3️⃣ Set up Python
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
 
+      # 4️⃣ Install dependencies
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip
+          pip install -r requirements.txt
+
+      # 5️⃣ Run EMA crossover script
+      - name: Run EMA script
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          mkdir -p logs
+          python ema_crossover_github.py
