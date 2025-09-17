@@ -1,4 +1,4 @@
-name: Run EMA Crossover every 30 minutes
+name: Run EMA Crossover every 30 minutes 
 
 on:
   schedule:
