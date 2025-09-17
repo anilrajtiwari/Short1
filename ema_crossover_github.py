@@ -1,9 +1,6 @@
-# rsi_macd_atr_short.py
-# Single timeframe RSI + MACD + ATR (15m)
-# Short-only plan:
-#   - Price < EMA-200 (trend filter)
-#   - RSI < 50 and falling OR MACD histogram just flipped negative
-#   - ATR-based stop loss (1.5x ATR above entry)
+# short_only_strategy.py (with fast Supertrend + corrected symbols)
+# Short-only strategy with multi-timeframe EMA filter (15m + 1h) + Supertrend
+# Relaxed EMA slope rule, broader pullback, ATR-based exits, closed-candle enforcement
 
 import os
 import ccxt
@@ -15,32 +12,38 @@ import time
 
 # === Config ===
 symbols = [
-    "KOMA/USDT:USDT","DOGS/USDT:USDT","NEIRO/USDT:USDT",
-    "ORDI/USDT:USDT","MEME/USDT:USDT","PIPPIN/USDT:USDT","BAN/USDT:USDT",
-    "OM/USDT:USDT","CHILLGUY/USDT:USDT","PONKE/USDT:USDT",
-    "BOME/USDT:USDT","MYRO/USDT:USDT","PEOPLE/USDT:USDT","PENGU/USDT:USDT",
-    "SPX/USDT:USDT","PNUT/USDT:USDT","FARTCOIN/USDT:USDT",
-    "HIPPO/USDT:USDT","AIXBT/USDT:USDT","BRETT/USDT:USDT","VINE/USDT:USDT",
-    "MOODENG/USDT:USDT","MUBARAK/USDT:USDT","MEW/USDT:USDT","POPCAT/USDT:USDT",
-    "DOGE/USDT:USDT","ACT/USDT:USDT",
-    "SLERF/USDT:USDT","DEGEN/USDT:USDT","WIF/USDT:USDT"
+    "KOMA/USDT","DOGS/USDT","NEIROETH/USDT","1000RATS/USDT","ORDI/USDT","MEME/USDT",
+    "PIPPIN/USDT","BAN/USDT","1000SHIB/USDT","OM/USDT","CHILLGUY/USDT","PONKE/USDT",
+    "BOME/USDT","MYRO/USDT","PEOPLE/USDT","PENGU/USDT","SPX/USDT","1000BONK/USDT",
+    "PNUT/USDT","FARTCOIN/USDT","HIPPO/USDT","AIXBT/USDT","BRETT/USDT","VINE/USDT",
+    "MOODENG/USDT","MUBARAK/USDT","MEW/USDT","POPCAT/USDT","1000FLOKI/USDT",
+    "DOGE/USDT","1000CAT/USDT","ACT/USDT","SLERF/USDT","DEGEN/USDT","WIF/USDT",
+    "1000PEPE/USDT"
 ]
-
 primary_exchanges = ['binanceusdm','bybit','okx']
 secondary_exchanges = ['gateio','kucoin','huobi','coinex','kraken','phemex','bitget']
 
-# Strategy settings
-ema_long = 200
 rsi_len = 14
-macd_fast, macd_slow, macd_signal = 12, 26, 9
-atr_len, atr_mult = 14, 1.5
-max_age_minutes = 150
+max_age_minutes = 30  # tightened freshness: ~≤ 2 bars on 15m
+
+# ATR-based exits
+atr_len = 14
+atr_tp_mult = 1.5  # TP = 1.5 * ATR(14)
+atr_sl_mult = 1.0  # SL = 1.0 * ATR(14)
+
+# Supertrend params (fast responding)
+st_atr_period = 7
+st_mult = 2.0
 
 # Telegram settings
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT_ID")
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage" if TELEGRAM_TOKEN else None
 TG_MAX = 4000
+
+# Track open positions
+# { "symbol": {"exchange": ex_id, "entry": price, "time": timestamp, "tp": tp_price, "sl": sl_price} }
+open_positions = {}
 
 # === Helpers ===
 def get_ema(df, length):
@@ -53,21 +56,52 @@ def get_rsi(df, length=14):
     rs = gain / loss.replace(0, 1e-10)
     return 100 - (100 / (1 + rs))
 
-def get_macd(df, fast=12, slow=26, signal=9):
-    ema_fast = df['close'].ewm(span=fast, adjust=False).mean()
-    ema_slow = df['close'].ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    macd_signal = macd_line.ewm(span=signal, adjust=False).mean()
-    macd_hist = macd_line - macd_signal
-    return macd_line, macd_signal, macd_hist
-
 def get_atr(df, length=14):
-    high_low = df['high'] - df['low']
-    high_close = (df['high'] - df['close'].shift()).abs()
-    low_close = (df['low'] - df['close'].shift()).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    prev_close = df['close'].shift(1)
+    tr1 = df['high'] - df['low']
+    tr2 = (df['high'] - prev_close).abs()
+    tr3 = (df['low'] - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     atr = tr.ewm(alpha=1/length, adjust=False).mean()
     return atr
+
+def get_supertrend(df, atr_period=7, multiplier=2.0):
+    hl2 = (df['high'] + df['low']) / 2
+    atr = get_atr(df, atr_period)
+
+    upperband = hl2 + (multiplier * atr)
+    lowerband = hl2 - (multiplier * atr)
+
+    final_upperband = upperband.copy()
+    final_lowerband = lowerband.copy()
+
+    for i in range(1, len(df)):
+        if df['close'].iloc[i-1] > final_upperband.iloc[i-1]:
+            final_upperband.iloc[i] = upperband.iloc[i]
+        else:
+            final_upperband.iloc[i] = min(upperband.iloc[i], final_upperband.iloc[i-1])
+
+        if df['close'].iloc[i-1] < final_lowerband.iloc[i-1]:
+            final_lowerband.iloc[i] = lowerband.iloc[i]
+        else:
+            final_lowerband.iloc[i] = max(lowerband.iloc[i], final_lowerband.iloc[i-1])
+
+    supertrend = pd.Series(index=df.index, dtype='float64')
+    in_uptrend = pd.Series(index=df.index, dtype='bool')
+
+    for i in range(len(df)):
+        if df['close'].iloc[i] > final_upperband.iloc[i]:
+            in_uptrend.iloc[i] = True
+        elif df['close'].iloc[i] < final_lowerband.iloc[i]:
+            in_uptrend.iloc[i] = False
+        else:
+            in_uptrend.iloc[i] = in_uptrend.iloc[i-1] if i > 0 else True
+
+        supertrend.iloc[i] = final_lowerband.iloc[i] if in_uptrend.iloc[i] else final_upperband.iloc[i]
+
+    df['supertrend'] = supertrend
+    df['in_uptrend'] = in_uptrend
+    return df
 
 def fetch_candles(exchange, symbol, tf="15m", limit=200):
     try:
@@ -102,9 +136,8 @@ def send_telegram_text_chunks(text):
         except Exception as e:
             print("Telegram send failed:", e)
 
-# === Evaluation ===
+# === Strategy ===
 def evaluate(symbol):
-    details = []
     exchanges_to_check = primary_exchanges + secondary_exchanges
     for ex_id in exchanges_to_check:
         try:
@@ -113,78 +146,148 @@ def evaluate(symbol):
             if not exchange.has.get("fetchOHLCV", False):
                 continue
 
-            df = fetch_candles(exchange, symbol, tf="15m", limit=200)
-            if df.empty: 
+            # --- 15m timeframe ---
+            df15 = fetch_candles(exchange, symbol, tf="15m", limit=200)
+            if df15.empty or len(df15) < 60:
                 continue
 
-            df["ema200"] = get_ema(df, ema_long)
-            df["rsi"] = get_rsi(df, rsi_len)
-            df["macd"], df["macd_signal"], df["macd_hist"] = get_macd(df, macd_fast, macd_slow, macd_signal)
-            df["atr"] = get_atr(df, atr_len)
+            df15["ema9"] = get_ema(df15, 9)
+            df15["ema21"] = get_ema(df15, 21)
+            df15["ema50"] = get_ema(df15, 50)
+            df15["rsi"] = get_rsi(df15, rsi_len)
+            df15["atr14"] = get_atr(df15, atr_len)
+            df15 = get_supertrend(df15, atr_period=st_atr_period, multiplier=st_mult)
 
-            last = df.iloc[-1]
-            prev = df.iloc[-2]
+            last15 = df15.iloc[-2]  # closed
+            prev15 = df15.iloc[-3]
 
-            if minutes_ago(last["time"]) > max_age_minutes:
+            if minutes_ago(last15["time"]) > max_age_minutes:
                 continue
 
-            # Trend filter
-            trend_ok = last["close"] < last["ema200"]
+            # --- 1h timeframe filter ---
+            df1h = fetch_candles(exchange, symbol, tf="1h", limit=200)
+            if df1h.empty or len(df1h) < 60:
+                continue
+            df1h["ema9"] = get_ema(df1h, 9)
+            df1h["ema21"] = get_ema(df1h, 21)
+            last1h = df1h.iloc[-2]
 
-            # Momentum filters
-            rsi_bear = last["rsi"] < 50 and last["rsi"] < prev["rsi"]
-            macd_bear = last["macd_hist"] < 0 and prev["macd_hist"] > 0
+            higher_tf_down = last1h["ema9"] < last1h["ema21"]
 
-            momentum_bear = rsi_bear or macd_bear
+            # === ENTRY ===
+            if symbol not in open_positions:
+                trend_down = (
+                    last15["ema9"] < last15["ema21"]
+                    and last15["close"] < last15["ema9"]
+                    and last15["close"] < last15["ema21"]
+                )
 
-            bearish_signal = trend_ok and momentum_bear
-            tag = "✅ SHORT" if bearish_signal else ""
+                rsi_pullback = last15["rsi"] > 50
 
-            signal = None
-            if bearish_signal:
-                stop_loss = last["close"] + last["atr"] * atr_mult
-                signal = (f"SHORT SIGNAL: {symbol} ({ex_id.upper()}) @ {last['close']:.6f} | "
-                          f"StopLoss={stop_loss:.6f} | {tag}")
+                def near_dynamic_ma(df, idx, pct_tol=0.003):
+                    row = df.iloc[idx]
+                    close = row["close"]
+                    d21 = abs(close - row["ema21"]) / close
+                    d50 = abs(close - row["ema50"]) / close
+                    return (d21 <= pct_tol) or (d50 <= pct_tol)
 
-            details.append(
-                f"{symbol} ({ex_id.upper()}) @ {last['close']:.6f} | "
-                f"EMA200={last['ema200']:.4f}, RSI={last['rsi']:.2f}, MACD_hist={last['macd_hist']:.4f}, ATR={last['atr']:.4f} "
-                f"| rsi_bear={'YES' if rsi_bear else 'NO'}, macd_bear={'YES' if macd_bear else 'NO'}, trend_ok={'YES' if trend_ok else 'NO'} {tag}"
-            )
+                recent_near = (
+                    near_dynamic_ma(df15, -2) or near_dynamic_ma(df15, -3) or near_dynamic_ma(df15, -4)
+                )
+                pullback_ok = rsi_pullback or recent_near
 
-            return signal, details, False
+                supertrend_short = (not last15["in_uptrend"]) and (last15["close"] < last15["supertrend"])
+
+                if higher_tf_down and trend_down and pullback_ok and supertrend_short:
+                    entry_price = last15["close"]
+                    entry_atr = df15["atr14"].iloc[-2]
+                    if pd.isna(entry_atr) or entry_atr <= 0:
+                        continue
+
+                    tp_price = entry_price - atr_tp_mult * entry_atr
+                    sl_price = entry_price + atr_sl_mult * entry_atr
+
+                    open_positions[symbol] = {
+                        "exchange": ex_id.upper(),
+                        "entry": entry_price,
+                        "time": last15["time"],
+                        "tp": tp_price,
+                        "sl": sl_price
+                    }
+                    return {
+                        "type": "entry",
+                        "symbol": symbol,
+                        "exchange": ex_id.upper(),
+                        "price": entry_price,
+                        "tp": tp_price,
+                        "sl": sl_price
+                    }
+
+            # === EXIT ===
+            else:
+                pos = open_positions[symbol]
+                entry_price = pos["entry"]
+                tp_price = pos["tp"]
+                sl_price = pos["sl"]
+                price = last15["close"]
+
+                tp_hit = price <= tp_price
+                sl_hit = price >= sl_price
+                trend_flip = last15["ema9"] >= last15["ema21"] or last15["in_uptrend"]
+
+                if tp_hit or sl_hit or trend_flip:
+                    reason = "TP" if tp_hit else ("SL" if sl_hit else "TrendFlip")
+                    del open_positions[symbol]
+                    return {
+                        "type": "exit",
+                        "symbol": symbol,
+                        "exchange": pos["exchange"],
+                        "price": price,
+                        "reason": reason
+                    }
 
         except Exception:
             continue
-
-    return None, [f"{symbol} not available on any exchange"], True
+    return None
 
 # === Main ===
-def main():
-    signals, details_all, missing = [], [], []
-    total, processed, strong_count = len(symbols), 0, 0
-
+def run_once():
+    signals, missing = [], []
     for sym in tqdm(symbols, desc="Checking coins", unit="coin"):
-        sig, det, is_missing = evaluate(sym)
-        details_all.extend(det)
-        if is_missing:
-            missing.append(sym)
+        result = evaluate(sym)
+        if result:
+            signals.append(result)
         else:
-            processed += 1
-        if sig:
-            signals.append(sig)
-            strong_count += 1
+            missing.append(sym)
 
-    lines = ["=== SHORT SIGNALS (RSI+MACD+ATR, 15m) ==="]
-    lines.extend(signals if signals else ["No valid short signals this run."])
-    lines.append("\n=== MISSING COINS ===")
-    lines.extend(missing if missing else ["None"])
-    lines.append(f"\n=== SUMMARY ===\nChecked: {total} | Processed: {processed} | Missing: {len(missing)} | "
-                 f"Signals: {len(signals)} (Valid: {strong_count})")
+    lines = [f"=== SHORT STRATEGY (15m + 1h EMA filter + Supertrend; Exits: TP={atr_tp_mult}xATR, SL={atr_sl_mult}xATR) ==="]
+    if signals:
+        for s in signals:
+            if s["type"] == "entry":
+                lines.append(
+                    f"📉 ENTRY SHORT {s['symbol']} ({s['exchange']}) @ {s['price']:.6f} | TP={s['tp']:.6f} SL={s['sl']:.6f}"
+                )
+            elif s["type"] == "exit":
+                lines.append(
+                    f"✅ EXIT {s['symbol']} ({s['exchange']}) @ {s['price']:.6f} | Reason={s['reason']}"
+                )
+    else:
+        lines.append("No signals this run.")
+
+    lines.append("\n=== Open Positions ===")
+    if open_positions:
+        for sym, pos in open_positions.items():
+            lines.append(f"{sym} @ {pos['entry']:.6f} ({pos['exchange']}) | TP={pos['tp']:.6f} SL={pos['sl']:.6f}")
+    else:
+        lines.append("None")
 
     final_text = "\n".join(lines)
     send_telegram_text_chunks(final_text)
     print(final_text)
 
 if __name__ == "__main__":
-    main()
+    while True:
+        print("\n===== New Scan at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "=====")
+        run_once()
+        print("Sleeping for 20 minutes...\n")
+        time.sleep(1200)  # wait 20 min
