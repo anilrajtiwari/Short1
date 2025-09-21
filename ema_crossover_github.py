@@ -1,26 +1,27 @@
 """
-crypto_screener_telegram.py - GitHub Actions Compatible Pump-Dump Screener
---------------------------------------------------------------------------
-- Designed to run on GitHub Actions
-- Sends results to Telegram
-- Optimized for CI/CD environment
-- No local file dependencies
+rt_github_improved.py — Enhanced Pump→Dump Screener
+-------------------------------------------------
+- Fixed static data issues with proper timestamp filtering
+- Added signal cooldown to prevent repeated signals
+- Dynamic thresholds based on coin volatility
+- EMA trend confirmation
+- Better logging and deduplication
 
-Dependencies: pip install ccxt pandas numpy requests
+Dependencies: pip install ccxt pandas numpy tqdm
 """
 
 import ccxt
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+import time
 import json
 import os
-import requests
-import sys
+from tqdm import tqdm
 import warnings
 warnings.filterwarnings("ignore")
 
-# ---------------- CONFIG ----------------
+# ---------------- USER CONFIG ----------------
 COIN_LIST = [
     'DOGE/USDT','SHIB/USDT','PEPE/USDT','WIF/USDT','BONK/USDT','FLOKI/USDT','MEME/USDT',
     'KOMA/USDT','DOGS/USDT','NEIROETH/USDT','1000RATS/USDT','ORDI/USDT','PIPPIN/USDT',
@@ -31,401 +32,378 @@ COIN_LIST = [
     'SLERF/USDT','DEGEN/USDT','1000PEPE/USDT'
 ]
 
-EXCHANGE_LIST = ['binance', 'bybit', 'kucoin']
+EXCHANGE_LIST = ['binance', 'bybit', 'kucoin']  # Removed 'okx' due to API issues
 
-# Trading parameters
 ROLL_1H = 100
 ROLL_15M = 200
 WATCH_HOURS = 1
-RECENT_PUMP_HOURS = 12
+SIGNAL_COOLDOWN_HOURS = 6  # Don't re-signal same coin for 6 hours
+RECENT_PUMP_HOURS = 12      # Only look for pumps in last 12 hours (increased for testing)
 
-# Thresholds
-Z_RET_BASE = 1.6  # Slightly lower for more signals
-Z_VOL_BASE = 1.8
-VOL_MULT_15 = 2.5  # Lower for more sensitivity
-BETA_CLOSE_NEAR_LOW = 0.35
+# Base thresholds (will be adjusted dynamically)
+Z_RET_BASE = 1.8
+Z_VOL_BASE = 2.0
+VOL_MULT_15 = 3.0
+BETA_CLOSE_NEAR_LOW = 0.30
 
-# Technical indicators
 EMA_FAST = 21
 EMA_SLOW = 50
 
-# Scoring
-MIN_SCORE = 0.20  # Lower threshold for GitHub environment
+# Files for persistence
+SIGNALS_LOG_FILE = "signals_log.json"
+LAST_SIGNALS_FILE = "last_signals.json"
 
-# ---------------- TELEGRAM FUNCTIONS ----------------
-def send_telegram_message(message):
-    """Send message to Telegram"""
-    bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
-    chat_id = os.getenv('TELEGRAM_CHAT_ID')
-    
-    if not bot_token or not chat_id:
-        print("ERROR: Telegram credentials not found in environment variables")
-        print("Required: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
-        return False
-    
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    
-    payload = {
-        'chat_id': chat_id,
-        'text': message,
-        'parse_mode': 'Markdown',
-        'disable_web_page_preview': True
-    }
-    
+# Enable debug logging
+DEBUG = False  # Set to False for clean output
+
+# ---------------- HELPERS ----------------
+def log_debug(message):
+    if DEBUG:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+
+def load_signal_history():
+    """Load previous signals to implement cooldown"""
+    if os.path.exists(LAST_SIGNALS_FILE):
+        try:
+            with open(LAST_SIGNALS_FILE, 'r') as f:
+                data = json.load(f)
+                # Convert string timestamps back to datetime
+                for coin in data:
+                    if data[coin]:
+                        data[coin] = datetime.fromisoformat(data[coin])
+                return data
+        except Exception as e:
+            log_debug(f"Error loading signal history: {e}")
+    return {}
+
+def save_signal_history(history):
+    """Save signal history for cooldown tracking"""
     try:
-        response = requests.post(url, json=payload, timeout=10)
-        if response.status_code == 200:
-            print("Message sent to Telegram successfully")
-            return True
-        else:
-            print(f"Failed to send Telegram message: {response.status_code}")
-            print(response.text)
-            return False
+        # Convert datetime to string for JSON serialization
+        save_data = {}
+        for coin, last_time in history.items():
+            save_data[coin] = last_time.isoformat() if last_time else None
+        
+        with open(LAST_SIGNALS_FILE, 'w') as f:
+            json.dump(save_data, f, indent=2)
     except Exception as e:
-        print(f"Error sending Telegram message: {e}")
-        return False
+        log_debug(f"Error saving signal history: {e}")
 
-def format_telegram_message(signals):
-    """Format signals for Telegram"""
-    if not signals:
-        return """🔍 *CRYPTO PUMP-DUMP SCREENER*
+def is_in_cooldown(coin, signal_history, current_time):
+    """Check if coin is in cooldown period"""
+    last_signal_time = signal_history.get(coin)
+    if last_signal_time:
+        hours_since = (current_time - last_signal_time).total_seconds() / 3600
+        return hours_since < SIGNAL_COOLDOWN_HOURS
+    return False
+
+def log_signal(coin, pump_time, confirm_time, score, exchange):
+    """Log detected signals"""
+    try:
+        log_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'coin': coin,
+            'pump_time': pump_time.isoformat(),
+            'confirm_time': confirm_time.isoformat(),
+            'score': score,
+            'exchange': exchange
+        }
         
-❌ No short signals detected
-Market conditions not favorable
-
-⏰ Next scan in 30 minutes
-🤖 Automated via GitHub Actions"""
-
-    message = f"🎯 *CRYPTO SHORT SIGNALS* ({len(signals)} found)\n"
-    message += "=" * 30 + "\n\n"
-    
-    for i, s in enumerate(signals, 1):
-        pump_time = s['pump_time'].strftime('%H:%M UTC')
-        confirm_time = s['confirm_time'].strftime('%H:%M UTC')
+        # Load existing log
+        log_data = []
+        if os.path.exists(SIGNALS_LOG_FILE):
+            with open(SIGNALS_LOG_FILE, 'r') as f:
+                log_data = json.load(f)
         
-        message += f"*#{i} {s['ticker']}*\n"
-        message += f"📊 Score: `{s['score']:.3f}`\n"
-        message += f"⬆️ Pump: {pump_time}\n"
-        message += f"⬇️ Dump: {confirm_time}\n"
-        message += f"🏛️ Exchange: {s.get('exchange', 'N/A')}\n"
-        message += f"📉 Action: *SHORT {s['ticker'].replace('/USDT', '')}*\n"
-        message += "—" * 25 + "\n\n"
-    
-    message += "⚠️ *TRADING NOTES:*\n"
-    message += "• Use 2-3% stop losses\n"
-    message += "• Target 5-10% profit\n"
-    message += "• Monitor 15m charts\n"
-    message += "• Risk management essential\n\n"
-    
-    message += f"⏰ Scanned at: {datetime.now().strftime('%H:%M UTC')}\n"
-    message += "🤖 Automated via GitHub Actions"
-    
-    return message
+        log_data.append(log_entry)
+        
+        # Keep only last 1000 entries
+        if len(log_data) > 1000:
+            log_data = log_data[-1000:]
+        
+        with open(SIGNALS_LOG_FILE, 'w') as f:
+            json.dump(log_data, f, indent=2)
+            
+    except Exception as e:
+        log_debug(f"Error logging signal: {e}")
 
-# ---------------- CORE FUNCTIONS ----------------
 def get_exchange(exchange_id):
-    """Get exchange instance with error handling"""
     try:
         ex_class = getattr(ccxt, exchange_id)
-        exchange = ex_class({
-            'enableRateLimit': True,
-            'timeout': 30000,
-            'rateLimit': 1200
-        })
-        return exchange
-    except Exception as e:
-        print(f"Error creating {exchange_id} exchange: {e}")
+        return ex_class({'enableRateLimit': True})
+    except Exception:
         return None
 
-def fetch_ohlcv_data(symbol, timeframe, limit=500):
-    """Fetch OHLCV data with fallback exchanges"""
+def fetch_ohlcv_fallback(symbol: str, timeframe: str, limit: int = 500):
+    """Fetch OHLCV with fallback across multiple exchanges (simple & reliable)"""
     for ex_id in EXCHANGE_LIST:
         ex = get_exchange(ex_id)
-        if not ex:
+        if ex is None:
             continue
-            
         try:
             ex.load_markets()
-            if not ex.has.get('fetchOHLCV', False):
+            if not getattr(ex, 'has', {}).get('fetchOHLCV', True):
                 continue
-                
-            ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-            if not ohlcv:
+
+            ohl = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            if not ohl:
                 continue
-                
-            df = pd.DataFrame(ohlcv, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
+
+            df = pd.DataFrame(ohl, columns=['ts', 'open','high','low','close','volume'])
             df['datetime'] = pd.to_datetime(df['ts'], unit='ms', utc=True)
-            
-            # Check data freshness (24 hours for GitHub environment)
-            latest_time = df['datetime'].max()
-            current_time = pd.Timestamp.now(tz='UTC')
-            hours_old = (current_time - latest_time).total_seconds() / 3600
-            
-            if hours_old > 24:
-                continue
-                
-            return df.dropna().sort_values('datetime').reset_index(drop=True), ex_id
-            
+
+            # Clean & sort
+            df = df.dropna().sort_values('datetime').reset_index(drop=True)
+            log_debug(f"Fetched {len(df)} candles for {symbol} from {ex_id}, latest: {df['datetime'].max()}")
+            return df, ex_id
+
         except Exception as e:
-            print(f"Error fetching {symbol} from {ex_id}: {e}")
+            log_debug(f"Error fetching {symbol} from {ex_id}: {e}")
             continue
-    
     return None, None
 
-def add_technical_indicators(df):
+def add_emas(df):
     """Add EMA indicators"""
-    if df is None or df.empty or len(df) < EMA_SLOW:
+    if df is None or df.empty or len(df) < EMA_SLOW: 
         return df
-    
     df = df.copy()
     df['EMA_21'] = df['close'].ewm(span=EMA_FAST, adjust=False).mean()
     df['EMA_50'] = df['close'].ewm(span=EMA_SLOW, adjust=False).mean()
     return df
 
-def calculate_z_scores(df):
-    """Calculate Z-scores for returns and volume"""
-    if len(df) < ROLL_1H:
-        return df
-    
-    df = df.copy()
-    
-    # Return Z-scores
-    df['ret_pct'] = df['close'].pct_change() * 100
-    df['ret_mean'] = df['ret_pct'].rolling(ROLL_1H, min_periods=20).mean()
-    df['ret_std'] = df['ret_pct'].rolling(ROLL_1H, min_periods=20).std().replace(0, np.nan)
-    df['z_ret'] = (df['ret_pct'] - df['ret_mean']) / df['ret_std']
-    
-    # Volume Z-scores
-    df['vol_mean'] = df['volume'].rolling(ROLL_1H, min_periods=20).mean()
-    df['vol_std'] = df['volume'].rolling(ROLL_1H, min_periods=20).std().replace(0, np.nan)
-    df['z_vol'] = (df['volume'] - df['vol_mean']) / df['vol_std']
-    
-    return df
-
-def calculate_15m_volume_stats(df):
-    """Calculate 15m volume statistics"""
-    if len(df) < 40:
-        return df
-    
-    df = df.copy()
-    df['vol_mean_15m'] = df['volume'].rolling(ROLL_15M, min_periods=20).mean()
-    return df
-
-def get_dynamic_thresholds(df):
-    """Calculate dynamic thresholds based on volatility"""
+def calculate_dynamic_thresholds(df):
+    """Calculate dynamic thresholds based on coin's volatility"""
     if df is None or df.empty:
         return Z_RET_BASE, Z_VOL_BASE
     
-    recent_returns = df['close'].pct_change().dropna()[-50:]
+    # Calculate recent volatility
+    recent_returns = df['close'].pct_change().dropna()[-50:]  # Last 50 periods
     if len(recent_returns) < 10:
         return Z_RET_BASE, Z_VOL_BASE
     
     volatility = recent_returns.std()
     
-    # Adjust thresholds
-    if volatility > 0.05:  # High volatility
-        z_ret = Z_RET_BASE + 0.3
-        z_vol = Z_VOL_BASE + 0.2
-    elif volatility < 0.02:  # Low volatility
-        z_ret = Z_RET_BASE - 0.2
-        z_vol = Z_VOL_BASE - 0.2
+    # Adjust thresholds based on volatility
+    if volatility > 0.05:  # Very volatile (>5% moves)
+        z_ret_threshold = Z_RET_BASE + 0.5
+        z_vol_threshold = Z_VOL_BASE + 0.3
+    elif volatility < 0.02:  # Low volatility (<2% moves)
+        z_ret_threshold = Z_RET_BASE - 0.3
+        z_vol_threshold = Z_VOL_BASE - 0.2
     else:
-        z_ret = Z_RET_BASE
-        z_vol = Z_VOL_BASE
+        z_ret_threshold = Z_RET_BASE
+        z_vol_threshold = Z_VOL_BASE
     
-    return max(1.2, z_ret), max(1.5, z_vol)
+    return max(1.2, z_ret_threshold), max(1.5, z_vol_threshold)
 
-def detect_pumps(df, z_ret_thresh, z_vol_thresh):
-    """Detect recent pump signals"""
-    if df.empty:
+# ---------------- DETECTION ----------------
+def compute_1h_stats(df_1h):
+    if len(df_1h) < ROLL_1H:
+        return df_1h
+    
+    df = df_1h.copy()
+    df['ret_pct'] = df['close'].pct_change() * 100
+    df['ret_mean'] = df['ret_pct'].rolling(ROLL_1H, min_periods=20).mean()
+    df['ret_std'] = df['ret_pct'].rolling(ROLL_1H, min_periods=20).std().replace(0, np.nan)
+    df['z_ret'] = (df['ret_pct'] - df['ret_mean']) / df['ret_std']
+    
+    df['vol_mean_1h'] = df['volume'].rolling(ROLL_1H, min_periods=20).mean()
+    df['vol_std_1h'] = df['volume'].rolling(ROLL_1H, min_periods=20).std().replace(0, np.nan)
+    df['z_vol'] = (df['volume'] - df['vol_mean_1h']) / df['vol_std_1h']
+    
+    return df
+
+def compute_15m_stats(df_15m):
+    if len(df_15m) < 40:
+        return df_15m
+    
+    df = df_15m.copy()
+    df['vol_mean_15m'] = df['volume'].rolling(ROLL_15M, min_periods=20).mean()
+    return df
+
+def detect_recent_pumps_1h(df_1h_stats, z_ret_threshold, z_vol_threshold):
+    """Only detect pumps in the last few hours, not just last 24 data points"""
+    if df_1h_stats.empty:
         return []
     
     current_time = pd.Timestamp.now(tz='UTC')
-    cutoff_time = current_time - timedelta(hours=RECENT_PUMP_HOURS)
+    recent_cutoff = current_time - timedelta(hours=RECENT_PUMP_HOURS)
     
-    recent_df = df[df['datetime'] >= cutoff_time].copy()
+    recent_df = df_1h_stats[df_1h_stats['datetime'] >= recent_cutoff].copy()
     if recent_df.empty:
         return []
     
-    # Basic pump conditions
-    pump_mask = (recent_df['z_ret'] >= z_ret_thresh) & (recent_df['z_vol'] >= z_vol_thresh)
+    mask = (recent_df['z_ret'] >= z_ret_threshold) & (recent_df['z_vol'] >= z_vol_threshold)
     
-    # EMA trend filter
     if 'EMA_21' in recent_df.columns:
         ema_filter = recent_df['close'] > recent_df['EMA_21']
-        pump_mask = pump_mask & ema_filter
+        mask = mask & ema_filter
     
-    return recent_df.index[pump_mask].tolist()
+    pump_indices = recent_df.index[mask].tolist()
+    
+    if pump_indices:
+        log_debug(f"Found {len(pump_indices)} recent pumps in last {RECENT_PUMP_HOURS} hours")
+    
+    return pump_indices
 
-def is_bearish_dump_signal(bar):
-    """Check if 15m bar shows bearish dump characteristics"""
-    if pd.isna(bar['vol_mean_15m']) or bar['vol_mean_15m'] == 0:
+def is_15m_bearish_vol_spike(bar_15m):
+    """Improved bearish volume spike detection"""
+    rng = bar_15m['high'] - bar_15m['low']
+    if rng <= 0: 
         return False
     
-    # Price conditions
-    range_size = bar['high'] - bar['low']
-    if range_size <= 0:
+    close_near_low = bar_15m['close'] <= bar_15m['low'] + BETA_CLOSE_NEAR_LOW * rng
+    bearish = bar_15m['close'] < bar_15m['open']
+    
+    mean15 = bar_15m.get('vol_mean_15m', np.nan)
+    if pd.isna(mean15) or mean15 == 0: 
         return False
+    vol_spike = bar_15m['volume'] >= VOL_MULT_15 * mean15
     
-    close_near_low = bar['close'] <= bar['low'] + BETA_CLOSE_NEAR_LOW * range_size
-    bearish_candle = bar['close'] < bar['open']
+    price_drop = (bar_15m['open'] - bar_15m['close']) / bar_15m['open']
+    significant_drop = price_drop > 0.015  
     
-    # Volume spike
-    vol_spike = bar['volume'] >= VOL_MULT_15 * bar['vol_mean_15m']
-    
-    # Significant price drop
-    price_drop = (bar['open'] - bar['close']) / bar['open']
-    significant_drop = price_drop > 0.01  # At least 1% drop
-    
-    # EMA break (if available)
     ema_break = True
-    if 'EMA_21' in bar.index and not pd.isna(bar.get('EMA_21')):
-        ema_break = bar['close'] < bar['EMA_21']
+    if 'EMA_21' in bar_15m.index and not pd.isna(bar_15m.get('EMA_21')):
+        ema_break = bar_15m['close'] < bar_15m['EMA_21']
     
-    return bearish_candle and close_near_low and vol_spike and significant_drop and ema_break
+    return bearish and close_near_low and vol_spike and significant_drop and ema_break
 
-def calculate_signal_score(pump_bar, dump_bar):
-    """Calculate signal strength score"""
-    # Z-score components
-    z_ret = float(pump_bar.get('z_ret', 0))
-    z_vol = float(pump_bar.get('z_vol', 0))
+# ---------------- SCORING ----------------
+def compute_signal_score(pump_row, confirm_row):
+    """Enhanced scoring with more factors"""
+    zret = float(pump_row.get('z_ret', 0.0))
+    zvol = float(pump_row.get('z_vol', 0.0))
     
-    s1 = min(1.0, max(0.0, z_ret / 4.0))
-    s2 = min(1.0, max(0.0, z_vol / 5.0))
+    s1 = min(1.0, max(0.0, zret / 5.0))
+    s2 = min(1.0, max(0.0, zvol / 6.0))
     
-    # Volume ratio
-    vol_ratio = dump_bar['volume'] / max(dump_bar.get('vol_mean_15m', 1), 1)
-    s3 = min(1.0, max(0.0, vol_ratio / (VOL_MULT_15 * 1.5)))
+    vol_ratio = confirm_row['volume'] / max(confirm_row.get('vol_mean_15m', 1.0), 1.0)
+    s3 = min(1.0, max(0.0, vol_ratio / (VOL_MULT_15 * 2)))
     
-    # Time decay
-    time_diff = (dump_bar['datetime'] - pump_bar['datetime']).total_seconds() / 60.0
-    s4 = max(0.0, 1.0 - (time_diff / (WATCH_HOURS * 60.0)))
+    dt = (confirm_row['datetime'] - pump_row['datetime']).total_seconds() / 60.0
+    s4 = max(0.0, 1.0 - (dt / (WATCH_HOURS * 60.0)))
     
-    # Price drop magnitude
-    price_drop = (dump_bar['open'] - dump_bar['close']) / dump_bar['open']
-    s5 = min(1.0, max(0.0, price_drop / 0.04))
+    price_drop = (confirm_row['open'] - confirm_row['close']) / confirm_row['open']
+    s5 = min(1.0, max(0.0, price_drop / 0.05))
     
-    return 0.3*s1 + 0.25*s2 + 0.2*s3 + 0.1*s4 + 0.15*s5
+    s6 = 1.0
+    if 'EMA_21' in pump_row.index and 'EMA_21' in confirm_row.index:
+        pump_above_ema = pump_row['close'] > pump_row.get('EMA_21', pump_row['close'])
+        confirm_below_ema = confirm_row['close'] < confirm_row.get('EMA_21', confirm_row['close'])
+        s6 = 1.0 if (pump_above_ema and confirm_below_ema) else 0.7
+    
+    final_score = 0.25*s1 + 0.20*s2 + 0.20*s3 + 0.10*s4 + 0.15*s5 + 0.10*s6
+    return float(final_score)
 
-# ---------------- MAIN SCANNER ----------------
-def scan_crypto_signals():
-    """Main scanning function"""
-    print(f"Starting crypto scan at {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+# ---------------- MAIN ----------------
+def scan_once():
+    """Enhanced scan with all improvements"""
     signals = []
-    processed = 0
+    signal_history = load_signal_history()
+    current_time = datetime.now()
     
-    for coin in COIN_LIST:
+    log_debug(f"Starting scan of {len(COIN_LIST)} coins...")
+    
+    for coin in tqdm(COIN_LIST, desc="Scanning coins", unit="coin"):
         try:
-            processed += 1
-            print(f"Processing {coin} ({processed}/{len(COIN_LIST)})")
+            if is_in_cooldown(coin, signal_history, current_time):
+                log_debug(f"Skipping {coin} - in cooldown for {SIGNAL_COOLDOWN_HOURS}h")
+                continue
             
-            # Fetch hourly data
-            df_1h, ex_1h = fetch_ohlcv_data(coin, '1h', ROLL_1H + 50)
+            df_1h, ex1 = fetch_ohlcv_fallback(coin, '1h', limit=ROLL_1H+50)
             if df_1h is None or len(df_1h) < ROLL_1H:
+                log_debug(f"Insufficient 1h data for {coin}")
                 continue
-            
-            # Fetch 15m data
-            df_15m, ex_15m = fetch_ohlcv_data(coin, '15m', ROLL_15M + 100)
+                
+            df_15m, ex15 = fetch_ohlcv_fallback(coin, '15m', limit=ROLL_15M+100)
             if df_15m is None or len(df_15m) < 40:
+                log_debug(f"Insufficient 15m data for {coin}")
                 continue
             
-            # Add technical indicators
-            df_1h = add_technical_indicators(calculate_z_scores(df_1h))
-            df_15m = add_technical_indicators(calculate_15m_volume_stats(df_15m))
+            z_ret_thresh, z_vol_thresh = calculate_dynamic_thresholds(df_1h)
+            log_debug(f"{coin} thresholds: z_ret={z_ret_thresh:.2f}, z_vol={z_vol_thresh:.2f}")
             
-            # Get dynamic thresholds
-            z_ret_thresh, z_vol_thresh = get_dynamic_thresholds(df_1h)
+            df_1h_stats = add_emas(compute_1h_stats(df_1h))
+            df_15m_stats = add_emas(compute_15m_stats(df_15m))
             
-            # Detect pumps
-            pump_indices = detect_pumps(df_1h, z_ret_thresh, z_vol_thresh)
-            if not pump_indices:
+            if df_1h_stats.empty or df_15m_stats.empty:
                 continue
             
-            print(f"  Found {len(pump_indices)} potential pumps in {coin}")
+            pump_idx_list = detect_recent_pumps_1h(df_1h_stats, z_ret_thresh, z_vol_thresh)
             
-            # Look for confirmations
-            for pump_idx in pump_indices:
-                pump_bar = df_1h.iloc[pump_idx]
-                pump_time = pump_bar['datetime']
+            if not pump_idx_list:
+                continue
+                
+            log_debug(f"{coin}: Found {len(pump_idx_list)} potential pumps")
+            
+            for pidx in pump_idx_list:
+                pump_row = df_1h_stats.iloc[pidx]
+                pump_time = pump_row['datetime']
                 watch_end = pump_time + timedelta(hours=WATCH_HOURS)
                 
-                # Get 15m confirmation window
-                confirmation_window = df_15m[
-                    (df_15m['datetime'] > pump_time) & 
-                    (df_15m['datetime'] <= watch_end)
-                ]
+                win15 = df_15m_stats[
+                    (df_15m_stats['datetime'] > pump_time) & 
+                    (df_15m_stats['datetime'] <= watch_end)
+                ].copy()
                 
-                if confirmation_window.empty:
+                if win15.empty:
                     continue
                 
-                # Look for bearish dump signal
-                for _, bar in confirmation_window.iterrows():
-                    if is_bearish_dump_signal(bar):
-                        score = calculate_signal_score(pump_bar, bar)
-                        
-                        if score >= MIN_SCORE:
-                            signals.append({
-                                'ticker': coin,
-                                'score': score,
-                                'pump_time': pump_time,
-                                'confirm_time': bar['datetime'],
-                                'exchange': ex_1h or ex_15m
-                            })
-                            print(f"  SIGNAL: {coin} - Score: {score:.3f}")
-                            break
+                confirmed = None
+                for _, bar in win15.iterrows():
+                    if is_15m_bearish_vol_spike(bar):
+                        confirmed = bar
+                        break
                 
-                if signals and signals[-1]['ticker'] == coin:
-                    break  # Only one signal per coin
-            
+                if confirmed is not None:
+                    score = compute_signal_score(pump_row, confirmed)
+                    
+                    if score >= 0.25:
+                        signals.append({
+                            'ticker': coin,
+                            'score': score,
+                            'pump_time': pump_time,
+                            'confirm_time': confirmed['datetime'],
+                            'exchange': ex1 or ex15
+                        })
+                        
+                        signal_history[coin] = current_time
+                        log_signal(coin, pump_time, confirmed['datetime'], score, ex1 or ex15)
+                        log_debug(f"SIGNAL: {coin} - Score: {score:.3f}")
+                        break  
+        
         except Exception as e:
-            print(f"Error processing {coin}: {e}")
+            log_debug(f"Error processing {coin}: {e}")
             continue
     
-    # Sort by score
+    save_signal_history(signal_history)
     signals.sort(key=lambda x: x['score'], reverse=True)
-    print(f"Scan complete. Found {len(signals)} signals.")
-    
+    log_debug(f"Scan complete. Found {len(signals)} signals.")
     return signals
 
-# ---------------- MAIN EXECUTION ----------------
-def main():
-    """Main function for GitHub Actions"""
-    try:
-        print("=== CRYPTO PUMP-DUMP SCREENER ===")
-        print("Running on GitHub Actions")
-        print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}")
-        print("-" * 50)
-        
-        # Run the scan
-        signals = scan_crypto_signals()
-        
-        # Format and send to Telegram
-        message = format_telegram_message(signals)
-        success = send_telegram_message(message)
-        
-        if success:
-            print("Results sent to Telegram successfully")
-        else:
-            print("Failed to send results to Telegram")
-            
-        # Also print to console for GitHub Actions logs
-        print("\n" + "=" * 50)
-        print("SCAN RESULTS:")
-        if signals:
-            for i, s in enumerate(signals, 1):
-                print(f"{i}. {s['ticker']} - Score: {s['score']:.3f}")
-        else:
-            print("No signals detected")
-        
-        print("=" * 50)
-        return 0 if success else 1
-        
-    except Exception as e:
-        error_msg = f"🚨 SCREENER ERROR\n\nFailed to run crypto scan:\n`{str(e)}`\n\nTime: {datetime.now().strftime('%H:%M UTC')}"
-        send_telegram_message(error_msg)
-        print(f"Critical error: {e}")
-        return 1
-
 if __name__ == "__main__":
-    exit_code = main()
-    sys.exit(exit_code)
+    print("=== CRYPTO PUMP-DUMP SCREENER ===")
+    print("Scanning for short opportunities...\n")
+    
+    results = scan_once()
+    
+    if not results:
+        print("NO SIGNALS DETECTED")
+        print("Market conditions not favorable for shorts")
+    else:
+        print(f"FOUND {len(results)} SHORT SIGNALS")
+        print("=" * 50)
+        
+        for i, s in enumerate(results, 1):
+            pump_time = s['pump_time'].strftime('%H:%M UTC')
+            confirm_time = s['confirm_time'].strftime('%H:%M UTC')
+            
+            print(f"#{i} {s['ticker']}")
+            print(f"   Score: {s['score']:.3f}")
+            print(f"   Pump: {pump_time} -> Dump: {confirm_time}")
+            print(f"   Exchange: {s.get('exchange', 'N/A')}")
+            print(f"   Action: SHORT {s['ticker'].replace('/USDT', '')}")
+            print("-" * 30)
+        
+        print("\
