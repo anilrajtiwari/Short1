@@ -406,4 +406,5 @@ if __name__ == "__main__":
             print(f"   Action: SHORT {s['ticker'].replace('/USDT', '')}")
             print("-" * 30)
         
-        print("\
+        print("\nNext scan recommended in 15-30 minutes")
+        print("=" * 50)
