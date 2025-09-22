@@ -1,31 +1,44 @@
 # planmod_coin_first.py
 #
-# Coin-first short-circuit scan with:
-# - Stop at first exchange where OHLCV is successfully fetched (per coin)
-# - Categorized logging to scan.log
-# - Original output sections: Impulse, Gradual, Potential Dumps, Confirmed Dumps
-# - Separate sections for Standalone Gradual dumps (Potential/Confirmed)
-# - One row per coin across all tables (mutually exclusive categories per cycle)
-# - Skipped-by-reason summary
-#
-# Output changes for CI/GitHub:
-# - Removed banner line
-# - Removed per-cycle timestamp line
-# - Removed tqdm/progress bar output
-# - Removed sleeping loop; script runs a single cycle and exits
-# - All printed tables show only: symbol, suggested_action
+# CI/GitHub-friendly scan:
+# - Single run (no sleep loop, no banners, no progress)
+# - Tables show only: symbol, suggested_action
+# - Skipped-by-reason section removed from stdout (still logged)
+# - Sends a Telegram summary every run (confirmed or not)
 
 import time
 import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
+import os
+import json
+import urllib.parse
+import urllib.request
 
 import ccxt
 import pandas as pd
 from tabulate import tabulate
 
-# Disable progress bar in CI
-tqdm = None
+# ================== TELEGRAM ==================
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+def tg_send(text, retries=2, timeout=15):
+    if not BOT_TOKEN or not CHAT_ID or not text:
+        return False
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    data = urllib.parse.urlencode({"chat_id": CHAT_ID, "text": text}).encode()
+    req = urllib.request.Request(url, data=data, method="POST")
+    for i in range(retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                resp = json.loads(r.read().decode())
+                return bool(resp.get("ok"))
+        except Exception:
+            if i < retries:
+                time.sleep(1.5 * (i + 1))
+            else:
+                return False
 
 # ================== CONFIG ==================
 
@@ -94,17 +107,6 @@ logger.addHandler(handler)
 
 def utcnow():
     return datetime.now(timezone.utc)
-
-def seconds_to_next_15m(now=None):
-    if now is None:
-        now = utcnow()
-    minute = now.minute
-    next_q = ((minute//15)+1)*15
-    if next_q >= 60:
-        next_dt = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-    else:
-        next_dt = now.replace(minute=next_q, second=0, microsecond=0)
-    return max(0, int((next_dt - now).total_seconds()))
 
 def load_exchange(eid):
     return getattr(ccxt, eid)({'enableRateLimit': True})
@@ -400,6 +402,7 @@ def run_cycle():
             logger.error(f"MARKETS_FAIL {eid} {e}")
             ex_markets.pop(eid, None)
 
+    # Keep skipped internally for logs; do not print to stdout
     skipped = {}
     def bucket(eid, reason, coin):
         skipped.setdefault(eid, {}).setdefault(reason, []).append(coin)
@@ -412,7 +415,6 @@ def run_cycle():
     rows_gradual_dump_confirmed = []  # standalone gradual only
 
     recent_cut = utcnow() - timedelta(hours=RECENT_WINDOW_HOURS)
-    progress = None  # progress disabled
 
     for coin in COIN_LIST:
         processed = False
@@ -615,45 +617,52 @@ def run_cycle():
                 bucket(eid, "UNKNOWN", coin)
                 logger.exception(f"UNKNOWN {eid} {coin} {e}")
 
-        # progress disabled
+    # --------- Print tables (symbol + suggested_action only) ---------
 
-    # progress disabled
-
-    def print_table(title, rows, order_cols):
+    def print_table(title, rows):
         print(f"\n=== {title} ===")
         if not rows:
             print("None")
             return
         dfp = pd.DataFrame(rows)
-        # Only output the requested columns (symbol, suggested_action)
         cols = ['symbol', 'suggested_action']
         for c in cols:
             if c not in dfp.columns:
                 dfp[c] = None
         print(tabulate(dfp[cols], headers="keys", tablefmt="pretty", showindex=False))
 
-    # Only show symbol and suggested_action for all sections
-    print_table("IMPULSE pumps", rows_impulse, ['symbol','suggested_action'])
-    print_table("GRADUAL pumps", rows_gradual, ['symbol','suggested_action'])
-    print_table("Potential dumps", rows_potential_dump, ['symbol','suggested_action'])
-    print_table("Confirmed dumps", rows_confirmed_dump, ['symbol','suggested_action'])
+    print_table("IMPULSE pumps", rows_impulse)
+    print_table("GRADUAL pumps", rows_gradual)
+    print_table("Potential dumps", rows_potential_dump)
+    print_table("Confirmed dumps", rows_confirmed_dump)
+    print_table("Standalone Gradual dumps (Potential)", rows_gradual_dump_potential)
+    print_table("Standalone Gradual dumps (Confirmed)", rows_gradual_dump_confirmed)
 
-    # Standalone gradual sections
-    print_table("Standalone Gradual dumps (Potential)", rows_gradual_dump_potential, ['symbol','suggested_action'])
-    print_table("Standalone Gradual dumps (Confirmed)", rows_gradual_dump_confirmed, ['symbol','suggested_action'])
+    # --------- Telegram summary (always send) ---------
 
-    print("\n=== Skipped by reason (per exchange) ===")
-    if not skipped:
-        print("None")
-    else:
-        for eid, reasons in skipped.items():
-            for reason, syms in reasons.items():
-                uniq = sorted(set(syms))
-                print(f"{eid} | {reason}: {len(uniq)} -> {', '.join(uniq)}")
+    def summarize(title, rows):
+        if not rows:
+            return f"{title}: None"
+        lines = [f"{title}:"]
+        for r in rows:
+            lines.append(f"- {r['symbol']} | {r.get('suggested_action','')}")
+        return "\n".join(lines)
+
+    summary_parts = [
+        summarize("IMPULSE pumps", rows_impulse),
+        summarize("GRADUAL pumps", rows_gradual),
+        summarize("Potential dumps", rows_potential_dump),
+        summarize("Confirmed dumps", rows_confirmed_dump),
+        summarize("Standalone Gradual dumps (Potential)", rows_gradual_dump_potential),
+        summarize("Standalone Gradual dumps (Confirmed)", rows_gradual_dump_confirmed),
+    ]
+    message = "Crypto Pump-Dump Screener\n" + "\n\n".join(summary_parts)
+    tg_send(message)
+
     logger.info("CYCLE_END")
 
 def main():
-    # Single run for CI/GitHub; scheduling handled externally
+    # Single CI run; scheduling managed by GitHub Actions
     run_cycle()
 
 if __name__ == "__main__":
