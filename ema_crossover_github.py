@@ -1,27 +1,34 @@
-"""
-rt_github_improved.py — Enhanced Pump→Dump Screener
--------------------------------------------------
-- Fixed static data issues with proper timestamp filtering
-- Added signal cooldown to prevent repeated signals
-- Dynamic thresholds based on coin volatility
-- EMA trend confirmation
-- Better logging and deduplication
+# planmod_coin_first.py
+#
+# Coin-first short-circuit scan with:
+# - Stop at first exchange where OHLCV is successfully fetched (per coin)
+# - Categorized logging to scan.log
+# - Original output sections: Impulse, Gradual, Potential Dumps, Confirmed Dumps
+# - Separate sections for Standalone Gradual dumps (Potential/Confirmed)
+# - One row per coin across all tables (mutually exclusive categories per cycle)
+# - Skipped-by-reason summary
+#
+# Output changes for CI/GitHub:
+# - Removed banner line
+# - Removed per-cycle timestamp line
+# - Removed tqdm/progress bar output
+# - Removed sleeping loop; script runs a single cycle and exits
+# - All printed tables show only: symbol, suggested_action
 
-Dependencies: pip install ccxt pandas numpy tqdm
-"""
+import time
+import logging
+from logging.handlers import RotatingFileHandler
+from datetime import datetime, timedelta, timezone
 
 import ccxt
 import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-import time
-import json
-import os
-from tqdm import tqdm
-import warnings
-warnings.filterwarnings("ignore")
+from tabulate import tabulate
 
-# ---------------- USER CONFIG ----------------
+# Disable progress bar in CI
+tqdm = None
+
+# ================== CONFIG ==================
+
 COIN_LIST = [
     'DOGE/USDT','SHIB/USDT','PEPE/USDT','WIF/USDT','BONK/USDT','FLOKI/USDT','MEME/USDT',
     'KOMA/USDT','DOGS/USDT','NEIROETH/USDT','1000RATS/USDT','ORDI/USDT','PIPPIN/USDT',
@@ -32,379 +39,622 @@ COIN_LIST = [
     'SLERF/USDT','DEGEN/USDT','1000PEPE/USDT'
 ]
 
-EXCHANGE_LIST = ['binance', 'bybit', 'kucoin']  # Removed 'okx' due to API issues
+EXCHANGE_LIST = [
+    'binance','bybit','kucoin','mexc','gateio','okx','bitget','huobi'
+]
 
-ROLL_1H = 100
-ROLL_15M = 200
-WATCH_HOURS = 1
-SIGNAL_COOLDOWN_HOURS = 6  # Don't re-signal same coin for 6 hours
-RECENT_PUMP_HOURS = 12      # Only look for pumps in last 12 hours (increased for testing)
+# Exchange-specific symbol hints
+SYMBOL_MAP = {
+    '1000PEPE/USDT': {'mexc':'PEPE1000/USDT','gateio':'PEPE1000/USDT','bitget':'PEPE1000/USDT'},
+    '1000BONK/USDT': {'mexc':'BONK1000/USDT'},
+    '1000FLOKI/USDT': {'mexc':'FLOKI1000/USDT'},
+    '1000SHIB/USDT': {'mexc':'SHIB1000/USDT'},
+    '1000CAT/USDT': {'mexc':'CAT1000/USDT'},
+}
 
-# Base thresholds (will be adjusted dynamically)
-Z_RET_BASE = 1.8
-Z_VOL_BASE = 2.0
-VOL_MULT_15 = 3.0
-BETA_CLOSE_NEAR_LOW = 0.30
+TIMEFRAME_TARGET = '15m'
+LOOKBACK_LIMIT = 400
+RECENT_WINDOW_HOURS = 48
+RATE_LIMIT_SLEEP_DEFAULT = 0.35
 
-EMA_FAST = 21
-EMA_SLOW = 50
+# Pump rules
+IMPULSE_WINDOW = 8            # bars
+IMPULSE_PCT_FLOOR = 0.18      # 18%
+GRADUAL_WINDOW = 24           # bars
+GRADUAL_PCT_FLOOR = 0.10      # 10%
 
-# Files for persistence
-SIGNALS_LOG_FILE = "signals_log.json"
-LAST_SIGNALS_FILE = "last_signals.json"
+# Drop rules (used for pump→drop and standalone dumps)
+DUMP_WINDOW = 36              # bars after peak
+DUMP_PCT_FLOOR = 0.12         # 12%
+POTENTIAL_DROP_FLOOR = 0.03   # 3%
 
-# Enable debug logging
-DEBUG = False  # Set to False for clean output
+# Standalone dump detectors (do not require a pump)
+# Sudden
+SUDDEN_BARS = 3
+SUDDEN_PCT_FLOOR = 0.06
+SUDDEN_ATR_MULT = 2.0
 
-# ---------------- HELPERS ----------------
-def log_debug(message):
-    if DEBUG:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+# Tuned Gradual (EARLY) — drop-from-recent-peak
+GRADUAL_DUMP_WINDOW = 16          # shorter window for earlier catch
+GRADUAL_DUMP_PCT_FLOOR = 0.07     # lower threshold for sensitivity
+GRADUAL_DUMP_EMA_FRAC = 0.60      # ≥60% closes below EMA20 since peak
+GRADUAL_DUMP_LHLL_MIN = 2         # ≥2 LH+LL steps since peak for structure
 
-def load_signal_history():
-    """Load previous signals to implement cooldown"""
-    if os.path.exists(LAST_SIGNALS_FILE):
-        try:
-            with open(LAST_SIGNALS_FILE, 'r') as f:
-                data = json.load(f)
-                # Convert string timestamps back to datetime
-                for coin in data:
-                    if data[coin]:
-                        data[coin] = datetime.fromisoformat(data[coin])
-                return data
-        except Exception as e:
-            log_debug(f"Error loading signal history: {e}")
-    return {}
+# Filters for confirmation
+REQUIRE_VOL_FOR_CONFIRMED = True       # volume gate
+REQUIRE_STRUCTURE_FOR_CONFIRMED = True # structure gate
 
-def save_signal_history(history):
-    """Save signal history for cooldown tracking"""
+# ================== LOGGING ==================
+logger = logging.getLogger("scan")
+logger.setLevel(logging.INFO)
+handler = RotatingFileHandler("scan.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+handler.setFormatter(fmt)
+logger.addHandler(handler)
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
+def seconds_to_next_15m(now=None):
+    if now is None:
+        now = utcnow()
+    minute = now.minute
+    next_q = ((minute//15)+1)*15
+    if next_q >= 60:
+        next_dt = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    else:
+        next_dt = now.replace(minute=next_q, second=0, microsecond=0)
+    return max(0, int((next_dt - now).total_seconds()))
+
+def load_exchange(eid):
+    return getattr(ccxt, eid)({'enableRateLimit': True})
+
+def normalize_base(s):
+    b, q = s.split('/')
+    return b.upper(), q.upper()
+
+def base_candidates(base):
+    out = {base}
+    if base.startswith("1000"):
+        out.add(base[4:])
+    else:
+        out.add("1000" + base)
+    out.add(base.replace("-", "").replace("_", ""))
+    return list(out)
+
+def is_perp_market(m):
     try:
-        # Convert datetime to string for JSON serialization
-        save_data = {}
-        for coin, last_time in history.items():
-            save_data[coin] = last_time.isoformat() if last_time else None
-        
-        with open(LAST_SIGNALS_FILE, 'w') as f:
-            json.dump(save_data, f, indent=2)
-    except Exception as e:
-        log_debug(f"Error saving signal history: {e}")
-
-def is_in_cooldown(coin, signal_history, current_time):
-    """Check if coin is in cooldown period"""
-    last_signal_time = signal_history.get(coin)
-    if last_signal_time:
-        hours_since = (current_time - last_signal_time).total_seconds() / 3600
-        return hours_since < SIGNAL_COOLDOWN_HOURS
+        if getattr(m, 'contract', False) or m.get('contract', False):
+            sym = m.get('symbol', '')
+            quote = m.get('quote', '')
+            return (':USDT' in sym) or (quote == 'USDT')
+    except Exception:
+        return False
     return False
 
-def log_signal(coin, pump_time, confirm_time, score, exchange):
-    """Log detected signals"""
-    try:
-        log_entry = {
-            'timestamp': datetime.now().isoformat(),
-            'coin': coin,
-            'pump_time': pump_time.isoformat(),
-            'confirm_time': confirm_time.isoformat(),
-            'score': score,
-            'exchange': exchange
-        }
-        
-        # Load existing log
-        log_data = []
-        if os.path.exists(SIGNALS_LOG_FILE):
-            with open(SIGNALS_LOG_FILE, 'r') as f:
-                log_data = json.load(f)
-        
-        log_data.append(log_entry)
-        
-        # Keep only last 1000 entries
-        if len(log_data) > 1000:
-            log_data = log_data[-1000:]
-        
-        with open(SIGNALS_LOG_FILE, 'w') as f:
-            json.dump(log_data, f, indent=2)
-            
-    except Exception as e:
-        log_debug(f"Error logging signal: {e}")
+def resolve_symbol(eid, canonical, markets):
+    mapped = SYMBOL_MAP.get(canonical, {}).get(eid)
+    if mapped and mapped in markets:
+        return mapped, "MAPPED"
+    if canonical in markets:
+        return canonical, "EXACT"
+    base, _ = normalize_base(canonical)
+    perp = f"{base}/USDT:USDT"
+    if perp in markets:
+        return perp, "PERP"
+    cands = base_candidates(base)
+    best_perp = None
+    best_spot = None
+    for sym, m in markets.items():
+        b = (m.get('base') or '').upper()
+        q = (m.get('quote') or '').upper()
+        if b in cands and (q == 'USDT' or ':USDT' in sym):
+            if is_perp_market(m):
+                if best_perp is None:
+                    best_perp = sym
+            else:
+                if best_spot is None:
+                    best_spot = sym
+    if best_perp:
+        return best_perp, "FUZZY_PERP"
+    if best_spot:
+        return best_spot, "FUZZY_SPOT"
+    for sym, m in markets.items():
+        b = (m.get('base') or '').upper()
+        if b in cands:
+            return sym, "FALLBACK"
+    return None, "NOT_FOUND"
 
-def get_exchange(exchange_id):
-    try:
-        ex_class = getattr(ccxt, exchange_id)
-        return ex_class({'enableRateLimit': True})
-    except Exception:
-        return None
+def pick_timeframe(ex):
+    tfs = getattr(ex, 'timeframes', None) or {}
+    if TIMEFRAME_TARGET in tfs:
+        return TIMEFRAME_TARGET, None
+    for tf in ['15m','5m','1m','30m','1h']:
+        if tf in tfs:
+            return tf, TIMEFRAME_TARGET
+    return TIMEFRAME_TARGET, None
 
-def fetch_ohlcv_fallback(symbol: str, timeframe: str, limit: int = 500):
-    """Fetch OHLCV with fallback across multiple exchanges (simple & reliable)"""
-    for ex_id in EXCHANGE_LIST:
-        ex = get_exchange(ex_id)
-        if ex is None:
-            continue
+def safe_fetch_ohlcv(ex, symbol, tf_req, limit):
+    for attempt in range(3):
         try:
-            ex.load_markets()
-            if not getattr(ex, 'has', {}).get('fetchOHLCV', True):
-                continue
-
-            ohl = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-            if not ohl:
-                continue
-
-            df = pd.DataFrame(ohl, columns=['ts', 'open','high','low','close','volume'])
-            df['datetime'] = pd.to_datetime(df['ts'], unit='ms', utc=True)
-
-            # Clean & sort
-            df = df.dropna().sort_values('datetime').reset_index(drop=True)
-            log_debug(f"Fetched {len(df)} candles for {symbol} from {ex_id}, latest: {df['datetime'].max()}")
-            return df, ex_id
-
+            return ex.fetch_ohlcv(symbol, tf_req, limit=limit)
+        except ccxt.RateLimitExceeded as e:
+            logger.warning(f"RATE_LIMIT {ex.id} {symbol} {tf_req} attempt={attempt+1} {e}")
+            time.sleep(max(getattr(ex, 'rateLimit', 350)/1000.0, RATE_LIMIT_SLEEP_DEFAULT) * (attempt+1))
+        except (ccxt.DDoSProtection, ccxt.NetworkError) as e:
+            logger.warning(f"NETWORK {ex.id} {symbol} {tf_req} attempt={attempt+1} {e}")
+            time.sleep(1.0 * (attempt+1))
+        except ccxt.BadSymbol as e:
+            logger.info(f"BAD_SYMBOL {ex.id} {symbol} {tf_req} {e}")
+            raise
         except Exception as e:
-            log_debug(f"Error fetching {symbol} from {ex_id}: {e}")
-            continue
-    return None, None
+            logger.error(f"UNKNOWN_FETCH {ex.id} {symbol} {tf_req} {e}")
+            time.sleep(0.5)
+    return ex.fetch_ohlcv(symbol, tf_req, limit=limit)
 
-def add_emas(df):
-    """Add EMA indicators"""
-    if df is None or df.empty or len(df) < EMA_SLOW: 
+def to_df(ohlcv):
+    if not ohlcv:
+        return pd.DataFrame(columns=['open','high','low','close','volume']).set_index(pd.DatetimeIndex([], tz='UTC'))
+    df = pd.DataFrame(ohlcv, columns=['ts','open','high','low','close','volume'])
+    df['dt'] = pd.to_datetime(df['ts'], unit='ms', utc=True)
+    return df.set_index('dt').drop(columns=['ts']).sort_index()
+
+def resample_to_target(df, target_tf):
+    if target_tf is None or df.empty:
+        return df
+    rule = {'1m':'1T','5m':'5T','15m':'15T','30m':'30T','1h':'1H'}.get(target_tf, '15T')
+    agg = {'open':'first','high':'max','low':'min','close':'last','volume':'sum'}
+    return df.resample(rule).apply(agg).dropna(how='any')
+
+def add_indicators(df):
+    if df.empty:
         return df
     df = df.copy()
-    df['EMA_21'] = df['close'].ewm(span=EMA_FAST, adjust=False).mean()
-    df['EMA_50'] = df['close'].ewm(span=EMA_SLOW, adjust=False).mean()
+    high, low, close, vol = df['high'], df['low'], df['close'], df['volume']
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    df['atr14'] = tr.rolling(14, min_periods=1).mean()
+    df['vol_ma'] = vol.rolling(20, min_periods=1).mean()
+    df['ema20'] = close.ewm(span=20, adjust=False).mean()
     return df
 
-def calculate_dynamic_thresholds(df):
-    """Calculate dynamic thresholds based on coin's volatility"""
-    if df is None or df.empty:
-        return Z_RET_BASE, Z_VOL_BASE
-    
-    # Calculate recent volatility
-    recent_returns = df['close'].pct_change().dropna()[-50:]  # Last 50 periods
-    if len(recent_returns) < 10:
-        return Z_RET_BASE, Z_VOL_BASE
-    
-    volatility = recent_returns.std()
-    
-    # Adjust thresholds based on volatility
-    if volatility > 0.05:  # Very volatile (>5% moves)
-        z_ret_threshold = Z_RET_BASE + 0.5
-        z_vol_threshold = Z_VOL_BASE + 0.3
-    elif volatility < 0.02:  # Low volatility (<2% moves)
-        z_ret_threshold = Z_RET_BASE - 0.3
-        z_vol_threshold = Z_VOL_BASE - 0.2
-    else:
-        z_ret_threshold = Z_RET_BASE
-        z_vol_threshold = Z_VOL_BASE
-    
-    return max(1.2, z_ret_threshold), max(1.5, z_vol_threshold)
+# ----------------- Pump detectors -----------------
 
-# ---------------- DETECTION ----------------
-def compute_1h_stats(df_1h):
-    if len(df_1h) < ROLL_1H:
-        return df_1h
-    
-    df = df_1h.copy()
-    df['ret_pct'] = df['close'].pct_change() * 100
-    df['ret_mean'] = df['ret_pct'].rolling(ROLL_1H, min_periods=20).mean()
-    df['ret_std'] = df['ret_pct'].rolling(ROLL_1H, min_periods=20).std().replace(0, np.nan)
-    df['z_ret'] = (df['ret_pct'] - df['ret_mean']) / df['ret_std']
-    
-    df['vol_mean_1h'] = df['volume'].rolling(ROLL_1H, min_periods=20).mean()
-    df['vol_std_1h'] = df['volume'].rolling(ROLL_1H, min_periods=20).std().replace(0, np.nan)
-    df['z_vol'] = (df['volume'] - df['vol_mean_1h']) / df['vol_std_1h']
-    
-    return df
+def detect_impulse(df):
+    if len(df) < IMPULSE_WINDOW + 2:
+        return None
+    w = df.iloc[-(IMPULSE_WINDOW+2):]
+    local_min_idx = w['close'].idxmin()
+    local_max_idx = w['close'].idxmax()
+    if local_max_idx <= local_min_idx:
+        return None
+    lowp = float(w.loc[local_min_idx, 'close'])
+    highp = float(w.loc[local_max_idx, 'close'])
+    pct = (highp - lowp) / lowp if lowp > 0 else 0.0
+    if pct >= IMPULSE_PCT_FLOOR:
+        peak = local_max_idx
+        atr = float(w.loc[peak, 'atr14']) if 'atr14' in w.columns else 0.0
+        return {
+            'category': 'IMPULSE',
+            'pump_pct': float(pct),
+            'pump_peak_time': peak,
+            'pump_peak_price': float(highp),
+            'atr_pct': float(atr / highp if highp > 0 else 0.0),
+        }
+    return None
 
-def compute_15m_stats(df_15m):
-    if len(df_15m) < 40:
-        return df_15m
-    
-    df = df_15m.copy()
-    df['vol_mean_15m'] = df['volume'].rolling(ROLL_15M, min_periods=20).mean()
-    return df
+def detect_gradual(df):
+    if len(df) < GRADUAL_WINDOW + 1:
+        return None
+    w = df.iloc[-(GRADUAL_WINDOW+1):]
+    start = float(w['close'].iloc[0])
+    end = float(w['close'].iloc[-1])
+    pct = (end - start) / start if start > 0 else 0.0
+    if pct >= GRADUAL_PCT_FLOOR:
+        peak = w.index[-1]
+        atr = float(w['atr14'].iloc[-1]) if 'atr14' in w.columns else 0.0
+        return {
+            'category': 'GRADUAL',
+            'pump_pct': float(pct),
+            'pump_peak_time': peak,
+            'pump_peak_price': float(end),
+            'atr_pct': float(atr / end if end > 0 else 0.0),
+        }
+    return None
 
-def detect_recent_pumps_1h(df_1h_stats, z_ret_threshold, z_vol_threshold):
-    """Only detect pumps in the last few hours, not just last 24 data points"""
-    if df_1h_stats.empty:
-        return []
-    
-    current_time = pd.Timestamp.now(tz='UTC')
-    recent_cutoff = current_time - timedelta(hours=RECENT_PUMP_HOURS)
-    
-    recent_df = df_1h_stats[df_1h_stats['datetime'] >= recent_cutoff].copy()
-    if recent_df.empty:
-        return []
-    
-    mask = (recent_df['z_ret'] >= z_ret_threshold) & (recent_df['z_vol'] >= z_vol_threshold)
-    
-    if 'EMA_21' in recent_df.columns:
-        ema_filter = recent_df['close'] > recent_df['EMA_21']
-        mask = mask & ema_filter
-    
-    pump_indices = recent_df.index[mask].tolist()
-    
-    if pump_indices:
-        log_debug(f"Found {len(pump_indices)} recent pumps in last {RECENT_PUMP_HOURS} hours")
-    
-    return pump_indices
+# ----------------- Standalone dump detectors -----------------
 
-def is_15m_bearish_vol_spike(bar_15m):
-    """Improved bearish volume spike detection"""
-    rng = bar_15m['high'] - bar_15m['low']
-    if rng <= 0: 
+def detect_sudden_dump(df, bars=SUDDEN_BARS, pct_floor=SUDDEN_PCT_FLOOR, atr_mult=SUDDEN_ATR_MULT):
+    if len(df) < bars + 1:
+        return None
+    w = df.iloc[-(bars+1):]
+    ref_time = w.index[0]
+    ref = float(w['close'].iloc[0])
+    low_min_idx = w['low'].idxmin()
+    lowp = float(w.loc[low_min_idx, 'low'])
+    pct_drop = (ref - lowp) / ref if ref > 0 else 0.0
+    atr = float(w['atr14'].iloc[-1]) if 'atr14' in w.columns else 0.0
+    wide = False
+    if atr > 0:
+        wide = (float(w['high'].iloc[-1]) - float(w['low'].iloc[-1])) >= atr_mult * atr
+    if pct_drop >= pct_floor or wide:
+        return {
+            'category': 'SUDDEN_DUMP',
+            'dump_pct': float(pct_drop),
+            'dump_time': low_min_idx,
+            'dump_price': float(lowp),
+            'ref_time': ref_time,
+            'ref_price': float(ref),
+            'atr_pct': float((atr / ref) if ref > 0 else 0.0),
+        }
+    return None
+
+def structure_metrics_since(df, start_time):
+    # Returns (lhll_count, below_ema_fraction)
+    if start_time not in df.index:
+        return 0, 0.0
+    i0 = df.index.get_loc(start_time)
+    seg = df.iloc[i0:]
+    if len(seg) < 2:
+        return 0, 0.0
+    lhll = 0
+    for i in range(1, len(seg)):
+        lh = float(seg['high'].iloc[i]) < float(seg['high'].iloc[i-1])
+        ll = float(seg['low'].iloc[i]) < float(seg['low'].iloc[i-1])
+        if lh and ll:
+            lhll += 1
+    below = (seg['close'] < seg['ema20']).sum() if 'ema20' in seg.columns else 0
+    frac = float(below) / float(len(seg)) if len(seg) > 0 else 0.0
+    return lhll, frac
+
+def detect_gradual_dump(df, window=GRADUAL_DUMP_WINDOW, pct_floor=GRADUAL_DUMP_PCT_FLOOR):
+    # Early, sensitive: drop-from-recent-peak inside window plus structure metrics
+    if len(df) < window + 1:
+        return None
+    w = df.iloc[-(window+1):]
+    peak_time = w['close'].idxmax()
+    peak_price = float(df.loc[peak_time, 'close'])
+    end_time = w.index[-1]
+    end_price = float(w['close'].iloc[-1])
+    if end_time <= peak_time:
+        return None
+    drop = (peak_price - end_price) / peak_price if peak_price > 0 else 0.0
+    if drop < pct_floor:
+        return None
+    lhll_cnt, below_frac = structure_metrics_since(df, peak_time)
+    if (below_frac < GRADUAL_DUMP_EMA_FRAC) or (lhll_cnt < GRADUAL_DUMP_LHLL_MIN):
+        return None
+    atr = float(df['atr14'].loc[end_time]) if 'atr14' in df.columns else 0.0
+    return {
+        'category': 'GRADUAL_DUMP',           # standalone gradual
+        'dump_pct': float(drop),
+        'dump_time': end_time,
+        'dump_price': float(end_price),
+        'ref_time': peak_time,
+        'ref_price': float(peak_price),
+        'atr_pct': float((atr / peak_price) if peak_price > 0 else 0.0),
+        'lhll_count': int(lhll_cnt),
+        'below_ema_frac': float(below_frac),
+    }
+
+# ----------------- Drop and confirmation helpers -----------------
+
+def detect_drop(df, peak_time, peak_price):
+    if peak_time not in df.index:
+        return 0.0, None
+    pidx = df.index.get_loc(peak_time)
+    end = min(len(df) - 1, pidx + DUMP_WINDOW)
+    max_drop = 0.0
+    t_at = None
+    for j in range(pidx + 1, end + 1):
+        lowj = float(df['low'].iloc[j])
+        drop = (peak_price - lowj) / peak_price if peak_price > 0 else 0.0
+        if drop > max_drop:
+            max_drop = drop
+            t_at = df.index[j]
+    return float(max_drop), t_at
+
+def structural_confirm(df, idx_time):
+    if idx_time not in df.index:
         return False
-    
-    close_near_low = bar_15m['close'] <= bar_15m['low'] + BETA_CLOSE_NEAR_LOW * rng
-    bearish = bar_15m['close'] < bar_15m['open']
-    
-    mean15 = bar_15m.get('vol_mean_15m', np.nan)
-    if pd.isna(mean15) or mean15 == 0: 
+    i = df.index.get_loc(idx_time)
+    if i < 1:
         return False
-    vol_spike = bar_15m['volume'] >= VOL_MULT_15 * mean15
-    
-    price_drop = (bar_15m['open'] - bar_15m['close']) / bar_15m['open']
-    significant_drop = price_drop > 0.015  
-    
-    ema_break = True
-    if 'EMA_21' in bar_15m.index and not pd.isna(bar_15m.get('EMA_21')):
-        ema_break = bar_15m['close'] < bar_15m['EMA_21']
-    
-    return bearish and close_near_low and vol_spike and significant_drop and ema_break
+    lh_ll = (float(df['high'].iloc[i]) < float(df['high'].iloc[i-1])) and (float(df['low'].iloc[i]) < float(df['low'].iloc[i-1]))
+    ema_break = ('ema20' in df.columns) and (float(df['close'].iloc[i]) < float(df['ema20'].iloc[i]))
+    return lh_ll or ema_break
 
-# ---------------- SCORING ----------------
-def compute_signal_score(pump_row, confirm_row):
-    """Enhanced scoring with more factors"""
-    zret = float(pump_row.get('z_ret', 0.0))
-    zvol = float(pump_row.get('z_vol', 0.0))
-    
-    s1 = min(1.0, max(0.0, zret / 5.0))
-    s2 = min(1.0, max(0.0, zvol / 6.0))
-    
-    vol_ratio = confirm_row['volume'] / max(confirm_row.get('vol_mean_15m', 1.0), 1.0)
-    s3 = min(1.0, max(0.0, vol_ratio / (VOL_MULT_15 * 2)))
-    
-    dt = (confirm_row['datetime'] - pump_row['datetime']).total_seconds() / 60.0
-    s4 = max(0.0, 1.0 - (dt / (WATCH_HOURS * 60.0)))
-    
-    price_drop = (confirm_row['open'] - confirm_row['close']) / confirm_row['open']
-    s5 = min(1.0, max(0.0, price_drop / 0.05))
-    
-    s6 = 1.0
-    if 'EMA_21' in pump_row.index and 'EMA_21' in confirm_row.index:
-        pump_above_ema = pump_row['close'] > pump_row.get('EMA_21', pump_row['close'])
-        confirm_below_ema = confirm_row['close'] < confirm_row.get('EMA_21', confirm_row['close'])
-        s6 = 1.0 if (pump_above_ema and confirm_below_ema) else 0.7
-    
-    final_score = 0.25*s1 + 0.20*s2 + 0.20*s3 + 0.10*s4 + 0.15*s5 + 0.10*s6
-    return float(final_score)
+def suggest_action(cat, recency_h, drop_frac):
+    if cat == 'CONFIRMED_DUMP' or cat == 'CONFIRMED_GRADUAL_DUMP':
+        return "Avoid chasing; wait stabilization"
+    if cat == 'POTENTIAL_DUMP' or cat == 'POTENTIAL_GRADUAL_DUMP':
+        return "Watch for reversal; avoid breakouts"
+    if cat == 'IMPULSE':
+        return "Wait pullback; no breakout buys"
+    if cat == 'GRADUAL':
+        return "Trend monitor; buy pullbacks"
+    return "Neutral; observe"
 
-# ---------------- MAIN ----------------
-def scan_once():
-    """Enhanced scan with all improvements"""
-    signals = []
-    signal_history = load_signal_history()
-    current_time = datetime.now()
-    
-    log_debug(f"Starting scan of {len(COIN_LIST)} coins...")
-    
-    for coin in tqdm(COIN_LIST, desc="Scanning coins", unit="coin"):
+# ----------------- Main cycle -----------------
+
+def run_cycle():
+    logger.info("CYCLE_START")
+
+    ex_objs = {}
+    ex_markets = {}
+    init_fail = set()
+
+    for eid in EXCHANGE_LIST:
         try:
-            if is_in_cooldown(coin, signal_history, current_time):
-                log_debug(f"Skipping {coin} - in cooldown for {SIGNAL_COOLDOWN_HOURS}h")
-                continue
-            
-            df_1h, ex1 = fetch_ohlcv_fallback(coin, '1h', limit=ROLL_1H+50)
-            if df_1h is None or len(df_1h) < ROLL_1H:
-                log_debug(f"Insufficient 1h data for {coin}")
-                continue
-                
-            df_15m, ex15 = fetch_ohlcv_fallback(coin, '15m', limit=ROLL_15M+100)
-            if df_15m is None or len(df_15m) < 40:
-                log_debug(f"Insufficient 15m data for {coin}")
-                continue
-            
-            z_ret_thresh, z_vol_thresh = calculate_dynamic_thresholds(df_1h)
-            log_debug(f"{coin} thresholds: z_ret={z_ret_thresh:.2f}, z_vol={z_vol_thresh:.2f}")
-            
-            df_1h_stats = add_emas(compute_1h_stats(df_1h))
-            df_15m_stats = add_emas(compute_15m_stats(df_15m))
-            
-            if df_1h_stats.empty or df_15m_stats.empty:
-                continue
-            
-            pump_idx_list = detect_recent_pumps_1h(df_1h_stats, z_ret_thresh, z_vol_thresh)
-            
-            if not pump_idx_list:
-                continue
-                
-            log_debug(f"{coin}: Found {len(pump_idx_list)} potential pumps")
-            
-            for pidx in pump_idx_list:
-                pump_row = df_1h_stats.iloc[pidx]
-                pump_time = pump_row['datetime']
-                watch_end = pump_time + timedelta(hours=WATCH_HOURS)
-                
-                win15 = df_15m_stats[
-                    (df_15m_stats['datetime'] > pump_time) & 
-                    (df_15m_stats['datetime'] <= watch_end)
-                ].copy()
-                
-                if win15.empty:
-                    continue
-                
-                confirmed = None
-                for _, bar in win15.iterrows():
-                    if is_15m_bearish_vol_spike(bar):
-                        confirmed = bar
-                        break
-                
-                if confirmed is not None:
-                    score = compute_signal_score(pump_row, confirmed)
-                    
-                    if score >= 0.25:
-                        signals.append({
-                            'ticker': coin,
-                            'score': score,
-                            'pump_time': pump_time,
-                            'confirm_time': confirmed['datetime'],
-                            'exchange': ex1 or ex15
-                        })
-                        
-                        signal_history[coin] = current_time
-                        log_signal(coin, pump_time, confirmed['datetime'], score, ex1 or ex15)
-                        log_debug(f"SIGNAL: {coin} - Score: {score:.3f}")
-                        break  
-        
+            ex = load_exchange(eid)
+            ex_objs[eid] = ex
+            logger.info(f"INIT_OK {eid}")
         except Exception as e:
-            log_debug(f"Error processing {coin}: {e}")
-            continue
-    
-    save_signal_history(signal_history)
-    signals.sort(key=lambda x: x['score'], reverse=True)
-    log_debug(f"Scan complete. Found {len(signals)} signals.")
-    return signals
+            logger.error(f"INIT_FAIL {eid} {e}")
+            init_fail.add(eid)
+
+    for eid, ex in list(ex_objs.items()):
+        try:
+            ex_markets[eid] = ex.load_markets()
+            logger.info(f"MARKETS_OK {eid} {len(ex_markets[eid])}")
+        except Exception as e:
+            logger.error(f"MARKETS_FAIL {eid} {e}")
+            ex_markets.pop(eid, None)
+
+    skipped = {}
+    def bucket(eid, reason, coin):
+        skipped.setdefault(eid, {}).setdefault(reason, []).append(coin)
+
+    rows_impulse = []
+    rows_gradual = []
+    rows_potential_dump = []
+    rows_confirmed_dump = []
+    rows_gradual_dump_potential = []  # standalone gradual only
+    rows_gradual_dump_confirmed = []  # standalone gradual only
+
+    recent_cut = utcnow() - timedelta(hours=RECENT_WINDOW_HOURS)
+    progress = None  # progress disabled
+
+    for coin in COIN_LIST:
+        processed = False
+
+        for eid in EXCHANGE_LIST:
+            if processed:
+                break
+            if eid in init_fail or eid not in ex_markets:
+                bucket(eid, "MARKETS_FAIL", coin)
+                continue
+
+            ex = ex_objs[eid]
+            markets = ex_markets[eid]
+            tf_req, tf_target = pick_timeframe(ex)
+
+            try:
+                resolved, how = resolve_symbol(eid, coin, markets)
+                if resolved is None:
+                    bucket(eid, "SYMBOL_NOT_FOUND", coin)
+                    logger.info(f"SYMBOL_NOT_FOUND {eid} {coin}")
+                    continue
+
+                try:
+                    raw = safe_fetch_ohlcv(ex, resolved, tf_req, LOOKBACK_LIMIT)
+                except ccxt.BadSymbol:
+                    bucket(eid, "BAD_SYMBOL", coin)
+                    logger.info(f"BAD_SYMBOL {eid} {resolved}")
+                    continue
+                except ccxt.BadRequest as e:
+                    bucket(eid, "TIMEFRAME_UNSUPPORTED", coin)
+                    logger.info(f"TIMEFRAME_UNSUPPORTED {eid} {resolved} {tf_req} {e}")
+                    continue
+                except Exception as e:
+                    bucket(eid, "FETCH_FAIL", coin)
+                    logger.error(f"FETCH_FAIL {eid} {resolved} {e}")
+                    continue
+
+                df = to_df(raw)
+                if tf_target:
+                    df = resample_to_target(df, tf_target)
+                if df.empty:
+                    bucket(eid, "OHLCV_EMPTY", coin)
+                    logger.info(f"OHLCV_EMPTY {eid} {resolved}")
+                    continue
+                df = add_indicators(df)
+
+                processed = True
+
+                # ----------------- Standalone dump check (FIRST) -----------------
+                sd = detect_sudden_dump(df)
+                gd = detect_gradual_dump(df)  # tuned early gradual (drop-from-peak)
+                ev_dump = None
+                if sd and gd:
+                    ev_dump = sd if sd['dump_pct'] >= gd['dump_pct'] else gd
+                elif sd:
+                    ev_dump = sd
+                elif gd:
+                    ev_dump = gd
+
+                if ev_dump is not None:
+                    dump_time = ev_dump['dump_time']
+                    if pd.notna(dump_time) and dump_time >= recent_cut:
+                        # volume gate at dump bar
+                        if 'vol_ma' in df.columns and dump_time in df.index:
+                            vol_gate = float(df.loc[dump_time, 'volume']) >= float(df.loc[dump_time, 'vol_ma'])
+                        else:
+                            vol_gate = True
+                        # structure gate (single-bar) for sudden; multi-bar already applied for gradual
+                        structure_gate = structural_confirm(df, dump_time) if ev_dump['category'] == 'SUDDEN_DUMP' else True
+
+                        dump_frac = float(ev_dump['dump_pct'])
+                        atr_pct = float(ev_dump.get('atr_pct', 0.0))
+                        confirmed_gate = dump_frac >= max(DUMP_PCT_FLOOR, atr_pct)
+
+                        if ev_dump['category'] == 'GRADUAL_DUMP':
+                            # Separate tables for standalone gradual
+                            if confirmed_gate and (not REQUIRE_VOL_FOR_CONFIRMED or vol_gate) and (not REQUIRE_STRUCTURE_FOR_CONFIRMED or True):
+                                cat = 'CONFIRMED_GRADUAL_DUMP'
+                            elif dump_frac >= POTENTIAL_DROP_FLOOR:
+                                cat = 'POTENTIAL_GRADUAL_DUMP'
+                            else:
+                                cat = None
+
+                            if cat is not None:
+                                rec_h = (utcnow() - dump_time).total_seconds() / 3600.0
+                                action = suggest_action(cat, rec_h, dump_frac)
+                                row = {
+                                    'symbol': coin,
+                                    'exchange': eid,
+                                    'category': cat,
+                                    'pump_pct': None,
+                                    'pump_peak_time': None,
+                                    'dump_time': dump_time,
+                                    'dump_pct_from_peak': round(dump_frac*100, 2),
+                                    'below_ema_frac': round(ev_dump.get('below_ema_frac', 0.0), 2),
+                                    'lhll_count': ev_dump.get('lhll_count', 0),
+                                    'suggested_action': action,
+                                }
+                                if cat == 'CONFIRMED_GRADUAL_DUMP':
+                                    rows_gradual_dump_confirmed.append(row)
+                                else:
+                                    rows_gradual_dump_potential.append(row)
+                                logger.info(f"EVENT {eid} {coin} {cat} standalone_gradual={row['dump_pct_from_peak']}%")
+                                time.sleep(getattr(ex, 'rateLimit', 350)/1000.0)
+                                break  # done with this coin
+                        else:
+                            # Sudden stays in generic dumps tables
+                            if confirmed_gate and (not REQUIRE_VOL_FOR_CONFIRMED or vol_gate) and (not REQUIRE_STRUCTURE_FOR_CONFIRMED or structure_gate):
+                                cat = 'CONFIRMED_DUMP'
+                            elif dump_frac >= POTENTIAL_DROP_FLOOR:
+                                cat = 'POTENTIAL_DUMP'
+                            else:
+                                cat = None
+
+                            if cat is not None:
+                                rec_h = (utcnow() - dump_time).total_seconds() / 3600.0
+                                action = suggest_action(cat, rec_h, dump_frac)
+                                row = {
+                                    'symbol': coin,
+                                    'exchange': eid,
+                                    'category': cat,
+                                    'pump_pct': None,
+                                    'pump_peak_time': None,
+                                    'dump_time': dump_time,
+                                    'dump_pct_from_peak': round(dump_frac*100, 2),
+                                    'suggested_action': action,
+                                }
+                                if cat == 'CONFIRMED_DUMP':
+                                    rows_confirmed_dump.append(row)
+                                else:
+                                    rows_potential_dump.append(row)
+                                logger.info(f"EVENT {eid} {coin} {cat} standalone_sudden={row['dump_pct_from_peak']}%")
+                                time.sleep(getattr(ex, 'rateLimit', 350)/1000.0)
+                                break  # done with this coin
+
+                # ----------------- Pump detection (FALLBACK) -----------------
+                imp = detect_impulse(df)
+                gra = detect_gradual(df)
+                ev = imp if imp else gra
+
+                if ev is None:
+                    logger.info(f"NO_EVENT {eid} {coin}")
+                    time.sleep(getattr(ex, 'rateLimit', 350)/1000.0)
+                    break
+
+                peak = ev['pump_peak_time']
+                if (not pd.notna(peak)) or (peak < recent_cut):
+                    logger.info(f"STALE_EVENT {eid} {coin} peak={peak}")
+                    time.sleep(getattr(ex, 'rateLimit', 350)/1000.0)
+                    break
+
+                peak_price = float(ev['pump_peak_price'])
+                atr_pct = float(ev['atr_pct'])
+                drop_frac, drop_time = detect_drop(df, peak, peak_price)
+
+                if drop_time is not None and 'vol_ma' in df.columns and peak in df.index:
+                    vol_gate = (float(df.loc[peak, 'volume']) >= float(df.loc[peak, 'vol_ma'])) or \
+                               (float(df.loc[drop_time, 'volume']) >= float(df.loc[drop_time, 'vol_ma']))
+                else:
+                    vol_gate = True
+
+                confirmed_gate = drop_frac >= max(DUMP_PCT_FLOOR, atr_pct)
+                structure_gate = (drop_time is not None) and structural_confirm(df, drop_time)
+
+                if confirmed_gate and (not REQUIRE_VOL_FOR_CONFIRMED or vol_gate) and (not REQUIRE_STRUCTURE_FOR_CONFIRMED or structure_gate):
+                    cat = 'CONFIRMED_DUMP'
+                elif drop_frac >= POTENTIAL_DROP_FLOOR:
+                    cat = 'POTENTIAL_DUMP'
+                else:
+                    cat = ev['category']
+
+                rec_h = (utcnow() - peak).total_seconds()/3600.0
+                action = suggest_action(cat, rec_h, drop_frac)
+
+                row = {
+                    'symbol': coin,
+                    'exchange': eid,
+                    'category': cat,
+                    'pump_pct': round(ev['pump_pct']*100, 2),
+                    'pump_peak_time': peak,
+                    'dump_time': drop_time if cat in ('POTENTIAL_DUMP','CONFIRMED_DUMP') else None,
+                    'dump_pct_from_peak': round(drop_frac*100, 2) if drop_frac > 0 else None,
+                    'suggested_action': action,
+                }
+
+                if cat == 'CONFIRMED_DUMP':
+                    rows_confirmed_dump.append(row)
+                elif cat == 'POTENTIAL_DUMP':
+                    rows_potential_dump.append(row)
+                elif cat == 'IMPULSE':
+                    rows_impulse.append(row)
+                elif cat == 'GRADUAL':
+                    rows_gradual.append(row)
+
+                logger.info(f"EVENT {eid} {coin} {cat} pump={row.get('pump_pct')}% drop={row.get('dump_pct_from_peak')}")
+                time.sleep(getattr(ex, 'rateLimit', 350)/1000.0)
+                break
+
+            except Exception as e:
+                bucket(eid, "UNKNOWN", coin)
+                logger.exception(f"UNKNOWN {eid} {coin} {e}")
+
+        # progress disabled
+
+    # progress disabled
+
+    def print_table(title, rows, order_cols):
+        print(f"\n=== {title} ===")
+        if not rows:
+            print("None")
+            return
+        dfp = pd.DataFrame(rows)
+        # Only output the requested columns (symbol, suggested_action)
+        cols = ['symbol', 'suggested_action']
+        for c in cols:
+            if c not in dfp.columns:
+                dfp[c] = None
+        print(tabulate(dfp[cols], headers="keys", tablefmt="pretty", showindex=False))
+
+    # Only show symbol and suggested_action for all sections
+    print_table("IMPULSE pumps", rows_impulse, ['symbol','suggested_action'])
+    print_table("GRADUAL pumps", rows_gradual, ['symbol','suggested_action'])
+    print_table("Potential dumps", rows_potential_dump, ['symbol','suggested_action'])
+    print_table("Confirmed dumps", rows_confirmed_dump, ['symbol','suggested_action'])
+
+    # Standalone gradual sections
+    print_table("Standalone Gradual dumps (Potential)", rows_gradual_dump_potential, ['symbol','suggested_action'])
+    print_table("Standalone Gradual dumps (Confirmed)", rows_gradual_dump_confirmed, ['symbol','suggested_action'])
+
+    print("\n=== Skipped by reason (per exchange) ===")
+    if not skipped:
+        print("None")
+    else:
+        for eid, reasons in skipped.items():
+            for reason, syms in reasons.items():
+                uniq = sorted(set(syms))
+                print(f"{eid} | {reason}: {len(uniq)} -> {', '.join(uniq)}")
+    logger.info("CYCLE_END")
+
+def main():
+    # Single run for CI/GitHub; scheduling handled externally
+    run_cycle()
 
 if __name__ == "__main__":
-    print("=== CRYPTO PUMP-DUMP SCREENER ===")
-    print("Scanning for short opportunities...\n")
-    
-    results = scan_once()
-    
-    if not results:
-        print("NO SIGNALS DETECTED")
-        print("Market conditions not favorable for shorts")
-    else:
-        print(f"FOUND {len(results)} SHORT SIGNALS")
-        print("=" * 50)
-        
-        for i, s in enumerate(results, 1):
-            pump_time = s['pump_time'].strftime('%H:%M UTC')
-            confirm_time = s['confirm_time'].strftime('%H:%M UTC')
-            
-            print(f"#{i} {s['ticker']}")
-            print(f"   Score: {s['score']:.3f}")
-            print(f"   Pump: {pump_time} -> Dump: {confirm_time}")
-            print(f"   Exchange: {s.get('exchange', 'N/A')}")
-            print(f"   Action: SHORT {s['ticker'].replace('/USDT', '')}")
-            print("-" * 30)
-        
-        print("\nNext scan recommended in 15-30 minutes")
-        print("=" * 50)
+    main()
