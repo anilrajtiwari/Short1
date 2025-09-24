@@ -2,7 +2,11 @@ name: Cleanup old workflow runs
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # run daily
+    - cron: '0 0 * * *'  # daily at midnight UTC
+
+concurrency:
+  group: cleanup-runs
+  cancel-in-progress: true
 
 jobs:
   cleanup:
@@ -13,5 +17,6 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           repository: ${{ github.repository }}
-          retain_days: 1      # keep last 3 days
+          workflow_name: 'Crypto Pump-Dump Screener'  # optional, only clean this workflow
+          retain_days: 3      # keep last 3 days
           keep_minimum_runs: 5
