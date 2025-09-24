@@ -20,7 +20,7 @@ import pandas as pd
 from tabulate import tabulate
 
 # ================== TELEGRAM ==================
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 def tg_send(text, retries=2, timeout=15):
