@@ -2,8 +2,8 @@ name: Crypto Pump-Dump Screener
 
 on:
   schedule:
-    # Run every 30 minutes
-    - cron: '*/30 * * * *'
+    # Run every 60 minutes
+    - cron: '*/60 * * * *'
   workflow_dispatch: # Manual trigger
 
 jobs:
